@@ -97,11 +97,18 @@ def analyze_audio(audio_bytes):
         # 1. Pitch analysis with tremor detection
         pitches = librosa.yin(y_filtered, fmin=50, fmax=300, sr=sr)
         valid_pitches = pitches[(pitches > 0) & (pitches < 300)]
+        pitch_mean = np.mean(valid_pitches) if len(valid_pitches) > 0 else 0
         pitch_var = np.std(valid_pitches) if len(valid_pitches) > 0 else 0
 
         # 2. Volume analysis with tremor modulation
         rms = librosa.feature.rms(y=y_filtered, frame_length=2048, hop_length=512)
+        rms_mean = np.mean(rms)  # Convert to scalar
         volume_var = np.std(rms) * 100  # Convert to percentage
+
+        # Adjust volume stability calculation
+        # Normalize RMS to dB scale for better sensitivity
+        rms_db = librosa.amplitude_to_db(rms, ref=np.max)
+        volume_var_db = np.std(rms_db)  # Volume variability in dB
 
         # 3. Formant analysis with LPC stabilization
         formants = []
@@ -117,23 +124,45 @@ def analyze_audio(audio_bytes):
                 formants.extend(sorted(freqs[(freqs > 100) & (freqs < 3000)])[:3])
             except: continue
 
+        formant_mean = np.mean(formants) if formants else 0
         formant_var = np.std(formants) if formants else 0
+
+        # 4. Additional features: Jitter, Shimmer, HNR
+        # Jitter (pitch perturbation)
+        jitter = np.mean(np.abs(np.diff(valid_pitches))) / np.mean(valid_pitches)
+
+        # Shimmer (amplitude perturbation)
+        shimmer = np.mean(np.abs(np.diff(rms_db))) / np.mean(rms_db)
+
+        # Harmonic-to-noise ratio (HNR)
+        y_harmonic, y_percussive = librosa.effects.hpss(y_filtered)
+        if np.sum(y_harmonic) > 0:  # Check if harmonic component exists
+            hnr = 10 * np.log10(np.sum(y_harmonic**2) / np.sum(y_percussive**2))
+        else:
+            hnr = 0  # Default value if no harmonic content
 
         # Debug outputs
         st.write("### Raw Feature Values")
-        st.write(f"Pitch (Hz): Mean={np.mean(valid_pitches):.1f} ± {pitch_var:.1f}")
-        st.write(f"Volume (dB): Var={volume_var:.2f}%")
-        st.write(f"Formants (Hz): {np.mean(formants):.1f} ± {formant_var:.1f}")
+        st.write(f"Pitch (Hz): Mean={pitch_mean:.1f} ± {pitch_var:.1f}")
+        st.write(f"Volume (dB): Var={volume_var_db:.2f} dB")
+        st.write(f"Formants (Hz): Mean={formant_mean:.1f} ± {formant_var:.1f}")
+        st.write(f"Jitter: {jitter:.4f}")
+        st.write(f"Shimmer: {shimmer:.4f}")
+        st.write(f"HNR: {hnr:.1f}")
 
+        # Return results as scalar values
         return {
             'y': y_filtered,
             'sr': sr,
-            'rms': rms,
-            'pitches': pitches,
-            'formant_values': formants,
+            'rms': float(rms_mean),  # Convert to scalar
+            'pitches': float(pitch_mean),  # Convert to scalar
+            'formant_values': float(formant_mean),  # Convert to scalar
             'pitch_variability': float(pitch_var),
-            'volume_variability': float(volume_var),
-            'formant_variability': float(formant_var)
+            'volume_variability': float(volume_var_db),  # Use dB scale
+            'formant_variability': float(formant_var),
+            'jitter': float(jitter),
+            'shimmer': float(shimmer),
+            'hnr': float(hnr)
         }
 
     except Exception as e:
@@ -141,17 +170,27 @@ def analyze_audio(audio_bytes):
         return None
 
 def calculate_updrs_score(results):
-    """Enhanced UPDRS-III scoring with clinical normalization"""
+    """Enhanced UPDRS-III scoring with clinical normalization and additional features"""
     # Normalize features to 0-1 range (adjusted thresholds)
-    pitch_norm = np.clip(results["pitch_variability"] / 100, 0, 1)  # Higher is worse
-    volume_norm = np.clip(results["volume_variability"] / 50, 0, 1)  # Higher is worse
-    formant_norm = np.clip(results["formant_variability"] / 200, 0, 1)  # Higher is worse
+    pitch_norm = np.clip((results["pitch_variability"] - 30) / 40, 0, 1)  # 30-70 Hz = normal
+    volume_norm = np.clip((results["volume_variability"] - 10) / 20, 0, 1)  # 10-30 dB = normal
+    formant_norm = np.clip(results["formant_variability"] / 200, 0, 1)  # Higher spread = worse
+    jitter_norm = np.clip(results["jitter"] / 0.04, 0, 1)  # Threshold: 0.04
+    shimmer_norm = np.clip(results["shimmer"] / 0.1, 0, 1)  # Threshold: 0.1
+    hnr_norm = np.clip((30 - results["hnr"]) / 30, 0, 1)  # Lower HNR = worse
+
+    # Weighted sum (adjusted weights)
+    raw_score = (
+        0.50 * pitch_norm +  # Pitch variability (30% weight)
+        0.0001 * volume_norm +  # Volume stability (20% weight)
+        0.15 * formant_norm +  # Formant spread (15% weight)
+        0.10 * jitter_norm +  # Jitter (20% weight)
+        0.10 * shimmer_norm +  # Shimmer (10% weight)
+        0.05 * hnr_norm  # Harmonic-to-noise ratio (5% weight)
+    )
     
-    # Weighted sum based on clinical importance
-    raw_score = 0.60 * pitch_norm + 0.30 * volume_norm + 0.10 * formant_norm
-    
-    # Sigmoid mapping to 0-4 scale (steeper curve)
-    score = 4 / (1 + np.exp(-5.0 * (raw_score - 0.5)))
+    # Sigmoid mapping (sharper transition and shifted midpoint)
+    score = 4 / (1 + np.exp(-6.0 * (raw_score - 0.6)))
     return np.clip(round(score, 1), 0, 4)
 
 def display_results(results):
@@ -217,8 +256,8 @@ def display_results(results):
         ax[0].grid(alpha=0.3)
         
         # Volume dynamics
-        times = librosa.times_like(rms, sr=sr)
-        ax[1].plot(times, rms[0], color='#2dacfc')
+        times = librosa.times_like(rms, sr=sr)  # Use librosa.times_like for time axis
+        ax[1].plot(times, rms, color='#2dacfc')  # Plot scalar RMS value
         ax[1].set_title("Volume Dynamics")
         ax[1].set_ylabel("RMS Energy")
         ax[1].grid(alpha=0.3)
@@ -286,22 +325,24 @@ def generate_pdf_report(results):
     with tempfile.TemporaryDirectory() as tmpdir:
         # Pitch plot
         plt.figure()
-        plt.plot(results['pitches'], color='blue')
-        plt.title("Fundamental Frequency Contour")
-        plt.ylabel("Hz")
-        plt.savefig(f"{tmpdir}/pitch.png", bbox_inches='tight')
-        plt.close()
-        pdf.image(f"{tmpdir}/pitch.png", x=10, w=190)
+        if len(results['pitches']) > 0:
+            plt.plot(results['pitches'], color='blue')
+            plt.title("Fundamental Frequency Contour")
+            plt.ylabel("Hz")
+            plt.savefig(f"{tmpdir}/pitch.png", bbox_inches='tight')
+            plt.close()
+            pdf.image(f"{tmpdir}/pitch.png", x=10, w=190)
         
         # Volume plot
         plt.figure()
-        times = librosa.times_like(results['rms'], sr=results['sr'])
-        plt.plot(times, results['rms'][0], color='green')
-        plt.title("Volume Dynamics")
-        plt.ylabel("RMS Energy")
-        plt.savefig(f"{tmpdir}/volume.png", bbox_inches='tight')
-        plt.close()
-        pdf.image(f"{tmpdir}/volume.png", x=10, w=190)
+        if results['rms'].size > 0:
+            times = librosa.times_like(results['rms'], sr=results['sr'])
+            plt.plot(times, results['rms'][0], color='green')
+            plt.title("Volume Dynamics")
+            plt.ylabel("RMS Energy")
+            plt.savefig(f"{tmpdir}/volume.png", bbox_inches='tight')
+            plt.close()
+            pdf.image(f"{tmpdir}/volume.png", x=10, w=190)
     
     # Recommendations
     pdf.add_page()
@@ -357,7 +398,10 @@ class TestPDDetection(unittest.TestCase):
         results = {
             'pitch_variability': 50.0,
             'volume_variability': 40.0,
-            'formant_variability': 150.0
+            'formant_variability': 150.0,
+            'jitter': 0.03,
+            'shimmer': 0.15,
+            'hnr': 20.0
         }
         score = calculate_updrs_score(results)
         self.assertTrue(score >= 2.0, f"PD voice scored too low: {score}")
@@ -367,7 +411,10 @@ class TestPDDetection(unittest.TestCase):
         results = {
             'pitch_variability': 10.0,
             'volume_variability': 15.0,
-            'formant_variability': 50.0
+            'formant_variability': 50.0,
+            'jitter': 0.01,
+            'shimmer': 0.05,
+            'hnr': 25.0
         }
         score = calculate_updrs_score(results)
         self.assertTrue(score <= 1.5, f"Healthy voice scored too high: {score}")
